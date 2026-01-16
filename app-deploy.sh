@@ -6,6 +6,23 @@ NAMESPACE="mfe-lab"
 ACR_NAME=$(az acr list -g $RG_NAME --query "[0].name" -o tsv)
 ACR_LOGIN_SERVER=$(az acr show -n $ACR_NAME --query loginServer -o tsv)
 
+# Verificar si Nginx ya está instalado, si no, instalarlo
+if ! kubectl get namespace ingress-internal > /dev/null 2>&1; then
+    echo "--- Instalando NGINX Ingress Controller Interno ---"
+    helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    helm repo update
+    
+    helm install nginx-internal ingress-nginx/ingress-nginx \
+        --namespace ingress-internal --create-namespace \
+        --set controller.service.loadBalancerIP=10.0.1.250 \
+        --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-internal"=true \
+        --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path"=/healthz \
+        --set controller.service.externalTrafficPolicy=Cluster
+    
+    echo "Esperando a que Nginx levante IP..."
+    sleep 30
+fi
+
 echo "--- 1. Construyendo Imágenes en $ACR_NAME ---"
 # Usamos tag v5 (o la versión final corregida)
 az acr build --registry $ACR_NAME --image foo-team:v5 ./foo-team

@@ -8,19 +8,22 @@ AKS_NAME="aks-mfe-lab"
 VNET_NAME="vnet-mfe-lab"
 AK_SUBNET="snet-aks"
 AGW_SUBNET="snet-appgw"
+# Definimos el prefijo explícitamente para usarlo en las reglas de firewall
+AGW_SUBNET_PREFIX="10.0.2.0/24" 
 AGW_NAME="agw-mfe-public"
 AGW_PUBLIC_IP_NAME="pip-agw-mfe"
-WAF_POLICY_NAME="waf-policy-mfe" # Nueva variable para la política
+WAF_POLICY_NAME="waf-policy-mfe"
 INTERNAL_INGRESS_IP="10.0.1.250"
 
 # Colores
 print_info() { echo -e "\e[34m[INFO]\e[0m $1"; }
 print_success() { echo -e "\e[32m[OK]\e[0m $1"; }
 print_skip() { echo -e "\e[33m[OMITIDO]\e[0m $1"; }
+print_warn() { echo -e "\e[31m[ATENCION]\e[0m $1"; }
 
 # --- FUNCIÓN DE CREACIÓN ---
 crear_recursos() {
-    print_info "Iniciando despliegue en $LOCATION..."
+    print_info "Iniciando despliegue automatizado en $LOCATION..."
 
     # 1. Grupo de Recursos
     if [ $(az group exists --name $RG_NAME) = "true" ]; then
@@ -47,7 +50,7 @@ crear_recursos() {
           --resource-group $RG_NAME \
           --vnet-name $VNET_NAME \
           --name $AGW_SUBNET \
-          --address-prefix 10.0.2.0/24
+          --address-prefix $AGW_SUBNET_PREFIX
     fi
 
     # 3. ACR
@@ -61,15 +64,14 @@ crear_recursos() {
         az acr create --resource-group $RG_NAME --name $ACR_NAME --sku Basic
     fi
 
-    # 4. AKS (FIX CIDR APLICADO)
+    # 4. AKS
     az aks show -g $RG_NAME -n $AKS_NAME &>/dev/null
     if [ $? -eq 0 ]; then
         print_skip "El Cluster AKS '$AKS_NAME' ya existe."
     else
-        print_info "Creando Cluster AKS (esto puede tardar unos 5-7 minutos)..."
+        print_info "Creando Cluster AKS (esto tarda 5-7 minutos)..."
         SUBNET_ID=$(az network vnet subnet show --resource-group $RG_NAME --vnet-name $VNET_NAME --name $AK_SUBNET --query id -o tsv)
         
-        # FIX: --service-cidr y --dns-service-ip para evitar conflicto con la VNet 10.0.0.0/16
         az aks create \
           --resource-group $RG_NAME \
           --name $AKS_NAME \
@@ -100,7 +102,7 @@ crear_recursos() {
           --sku Standard
     fi
 
-    # 6. Política WAF (NUEVO PASO REQUERIDO PARA WAF_v2)
+    # 6. Política WAF
     az network application-gateway waf-policy show -g $RG_NAME -n $WAF_POLICY_NAME &>/dev/null
     if [ $? -eq 0 ]; then
         print_skip "La Política WAF '$WAF_POLICY_NAME' ya existe."
@@ -114,14 +116,13 @@ crear_recursos() {
           --version 3.2
     fi
 
-    # 7. Application Gateway (FIX WAF APLICADO)
+    # 7. Application Gateway
     az network application-gateway show -g $RG_NAME -n $AGW_NAME &>/dev/null
     if [ $? -eq 0 ]; then
         print_skip "El Application Gateway '$AGW_NAME' ya existe."
     else
-        print_info "Creando Application Gateway (WAF v2)... Esto tarda unos 10-15 min."
+        print_info "Creando Application Gateway (WAF v2)... Esto tarda 10-15 min."
         
-        # FIX: Agregado --waf-policy para solucionar el error de configuración faltante
         az network application-gateway create \
           --name $AGW_NAME \
           --resource-group $RG_NAME \
@@ -138,10 +139,83 @@ crear_recursos() {
           --servers "$INTERNAL_INGRESS_IP"
     fi
 
-    print_success "--- Infraestructura Lista ---"
+
+    # 8. CONFIGURACIÓN DE RED (NSG & FIREWALL)
+    print_info "Configurando reglas de seguridad (NSG) para AKS..."
+    
+    # 8.1 Obtener Grupo de Recursos de Nodos (MC_...)
+    NODE_RG=$(az aks show -g $RG_NAME -n $AKS_NAME --query nodeResourceGroup -o tsv)
+    print_info "Grupo de recursos de nodos detectado: $NODE_RG"
+    
+    # 8.2 Obtener nombre del NSG
+    NSG_NAME=$(az network nsg list -g $NODE_RG --query "[0].name" -o tsv)
+    
+    if [ -n "$NSG_NAME" ]; then
+        print_info "NSG detectado: $NSG_NAME. Aplicando reglas..."
+        
+        # 8.3 Regla: Permitir Gateway -> AKS (Puerto 80/443)
+        az network nsg rule create \
+          --resource-group $NODE_RG \
+          --nsg-name $NSG_NAME \
+          --name AllowAGWInbound \
+          --priority 150 \
+          --source-address-prefixes $AGW_SUBNET_PREFIX \
+          --destination-port-ranges 80 443 \
+          --direction Inbound \
+          --access Allow \
+          --protocol Tcp \
+          --description "Permitir trafico desde App Gateway" \
+          --output none 2>/dev/null || print_skip "Regla AllowAGWInbound ya existe o error menor."
+
+        # 8.4 Regla: Permitir Azure LB Probe (168.63.129.16)
+        az network nsg rule create \
+          --resource-group $NODE_RG \
+          --nsg-name $NSG_NAME \
+          --name AllowAzureLBProbe \
+          --priority 140 \
+          --source-address-prefixes 168.63.129.16 \
+          --destination-port-ranges 80 443 \
+          --direction Inbound \
+          --access Allow \
+          --protocol Tcp \
+          --description "Permitir Azure Health Probes" \
+          --output none 2>/dev/null || print_skip "Regla AllowAzureLBProbe ya existe o error menor."
+    else
+        print_warn "No se pudo encontrar el NSG en $NODE_RG. Verifica permisos."
+    fi
+
+    # 9. CONFIGURACIÓN HEALTH PROBE (Vital para Nginx)
+    PROBE_NAME="probe-nginx-internal"
+    HTTP_SETTINGS="appGatewayBackendHttpSettings" # Nombre default de Azure CLI
+
+    print_info "Configurando Health Probe personalizada para Nginx..."
+    
+    # 9.1 Crear/Actualizar la sonda
+    az network application-gateway probe create \
+      --resource-group $RG_NAME \
+      --gateway-name $AGW_NAME \
+      --name $PROBE_NAME \
+      --path "/healthz" \
+      --protocol Http \
+      --host "127.0.0.1" \
+      --interval 30 \
+      --timeout 30 \
+      --threshold 3 \
+      --match-status-codes "200-399" \
+      --output none
+
+    # 9.2 Asociar la sonda al Backend
+    az network application-gateway http-settings update \
+      --resource-group $RG_NAME \
+      --gateway-name $AGW_NAME \
+      --name $HTTP_SETTINGS \
+      --probe $PROBE_NAME \
+      --output none
+      
+    print_success "--- Infraestructura Completada Exitosamente ---"
     echo " > ACR Name: $ACR_NAME"
     echo " > IP Publica Gateway: $(az network public-ip show --resource-group $RG_NAME --name $AGW_PUBLIC_IP_NAME --query ipAddress -o tsv)"
-    echo " > IMPORTANTE: Usa la IP interna $INTERNAL_INGRESS_IP al instalar el Nginx Ingress."
+    echo " > NOTA: El firewall y las sondas ya estan configurados."
 }
 
 # --- FUNCIÓN DE DESTRUCCIÓN ---
